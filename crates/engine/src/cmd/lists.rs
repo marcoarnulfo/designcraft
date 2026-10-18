@@ -2,7 +2,7 @@
 //! story to story. Paragraphs join one with `listName` (and restart with `startAt`). Convert
 //! Bullets and Numbering to Text types the labels in.
 
-use designcraft_doc::{ChangeMark, CharFormat, Document, ListType, NO_CHAR_STYLE, NumberedList, ParaAttrs, Story};
+use designcraft_doc::{ChangeMark, CharFormat, Document, ListType, NO_CHAR_STYLE, NumberedList, ParaAttrs, Story, TabAlign, TabStop};
 use serde_json::{Value, json};
 
 use super::text::{Target, format_targets, reserve_command_text};
@@ -60,8 +60,9 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
-/// Per target, the labels to type in: each one's paragraph start, text and format.
-type Labels = Vec<(Target, Vec<(usize, String, CharFormat)>)>;
+/// Per target, the labels to type in (each one's paragraph start, text and format), and the
+/// paragraphs whose Tab Position becomes a tab stop (index and their tabs with it).
+type Labels = Vec<(Target, Vec<(usize, String, CharFormat)>, Vec<(usize, Vec<TabStop>)>)>;
 
 fn convert_to_text(s: &mut Session) -> Result<Value> {
     let targets = format_targets(s);
@@ -75,6 +76,7 @@ fn convert_to_text(s: &mut Session) -> Result<Value> {
         let ranges = st.para_ranges();
         let (a, b) = (st.para_at(t.range.start), st.para_at(t.range.end.max(t.range.start)));
         let mut labels = Vec::new();
+        let mut tabs = Vec::new();
         for pi in a..=b {
             let (Some(Some(label)), Some(r), Some(p)) = (all.get(pi), ranges.get(pi), st.paras.get(pi)) else { continue };
             let mut fmt = label_format(d, st, p, r.clone());
@@ -83,17 +85,25 @@ fn convert_to_text(s: &mut Session) -> Result<Value> {
                 fmt.over.change = Some(ChangeMark::Inserted);
             }
             labels.push((r.start, label.clone(), fmt));
+            if let Some(t) = list_tab_stops(d, p) {
+                tabs.push((pi, t));
+            }
         }
-        todo.push((t, labels));
+        todo.push((t, labels, tabs));
     }
-    let converted: usize = todo.iter().map(|(_, l)| l.len()).sum();
+    let converted: usize = todo.iter().map(|(_, l, _)| l.len()).sum();
     if converted == 0 {
         return Ok(json!({"converted": 0}));
     }
     s.edit(|d, sel| {
-        for (t, labels) in &todo {
+        for (t, labels, tabs) in &todo {
             let st = d.text_story_mut(t.story, t.cell).ok_or(designcraft_doc::DocError::NoStory(t.story))?;
             st.format_paras(t.range.clone(), |p| p.para.merge(&ParaAttrs { list_type: Some(ListType::None), ..Default::default() }));
+            for (pi, stops) in tabs {
+                if let Some(p) = st.paras.get_mut(*pi) {
+                    p.para.tabs = Some(stops.clone());
+                }
+            }
             reserve_command_text(st, labels.iter().map(|(_, l, _)| l.len()).sum())?;
             // Last first, so the earlier paragraphs' starts still hold.
             for (at, label, fmt) in labels.iter().rev() {
@@ -107,6 +117,17 @@ fn convert_to_text(s: &mut Session) -> Result<Value> {
         }
         Ok(json!({"converted": converted}))
     })
+}
+
+/// A list paragraph's tab stops with its Tab Position as a left stop, when composition adds that
+/// stop for the label only: the typed-in label's tab then still reaches it. The IDML export
+/// writes Tab Position as the same stop.
+fn list_tab_stops(d: &Document, p: &designcraft_doc::ParaFormat) -> Option<Vec<TabStop>> {
+    let (pp, _) = d.styles.resolve_para(p);
+    let t = pp.list_tab.filter(|t| t.is_finite() && *t >= 0.0 && !pp.tabs.iter().any(|s| (s.position - t).abs() < 1e-6))?;
+    let mut tabs = pp.tabs;
+    tabs.push(TabStop { position: t, align: TabAlign::Left, leader: String::new(), align_on: String::new() });
+    Some(TabStop::sanitized_list(tabs))
 }
 
 /// The format of a paragraph's label as composition draws it: the paragraph style's characters
@@ -324,5 +345,41 @@ mod tests {
             assert_eq!(st.char_format_of(at).over.change, Some(designcraft_doc::ChangeMark::Inserted), "label at {at}");
         }
         assert_eq!(st.char_format_of(3).over.change, None);
+    }
+
+    /// The label's and the text's x from the column's left: a Tab Position keeps placing the text
+    /// once the label is typed in.
+    #[test]
+    fn convert_to_text_keeps_the_text_at_the_tab_position() {
+        let xs = |s: &Session, sid: u64| {
+            let d = &s.doc().unwrap().doc;
+            let cs = designcraft_compose::compose_story(d, designcraft_doc::StoryId(sid), &Default::default());
+            let col = cs.frames[0].columns[0];
+            let l = &cs.frames[0].lines[0];
+            let body_at = d.story(designcraft_doc::StoryId(sid)).unwrap().text.find("Item").unwrap();
+            let label = l.glyphs.iter().find(|g| g.len == 0 || g.byte < body_at).map(|g| g.x - col.x0).unwrap();
+            let body = l.glyphs.iter().find(|g| g.len > 0 && g.byte == body_at).map(|g| g.x - col.x0).unwrap();
+            (label, body)
+        };
+        let cases = [
+            ("bullets, Tab Position 50", json!({"listType": "bullets", "listTab": 50.0})),
+            ("numbers, Tab Position 50", json!({"listType": "numbers", "listTab": 50.0})),
+            (
+                "numbers, indents 36/-18, Tab Position 30",
+                json!({"listType": "numbers", "leftIndent": 36.0, "firstLineIndent": -18.0, "listTab": 30.0}),
+            ),
+            ("numbers, indents 36/-18", json!({"listType": "numbers", "leftIndent": 36.0, "firstLineIndent": -18.0})),
+        ];
+        for (name, attrs) in cases {
+            let mut s = Session::new();
+            s.execute("file.new", &json!({})).unwrap();
+            let sid = list_story(&mut s, "Item", attrs);
+            let (label, body) = xs(&s, sid);
+            select(&mut s, sid, 0, 0);
+            convert(&mut s);
+            let (label_after, body_after) = xs(&s, sid);
+            assert!((label - label_after).abs() < 0.01, "{name}: label {label} -> {label_after}");
+            assert!((body - body_after).abs() < 0.01, "{name}: text {body} -> {body_after}");
+        }
     }
 }
