@@ -2,7 +2,9 @@
 //! story to story. Paragraphs join one with `listName` (and restart with `startAt`). Convert
 //! Bullets and Numbering to Text types the labels in.
 
-use designcraft_doc::{ChangeMark, CharFormat, Document, ListType, NO_CHAR_STYLE, NumberedList, ParaAttrs, Story, TabAlign, TabStop};
+use designcraft_doc::{
+    ChangeMark, CharFormat, Document, ListType, NO_CHAR_STYLE, NumberedList, ParaAttrs, SAME_TAB_POSITION, Story, TabAlign, TabStop,
+};
 use serde_json::{Value, json};
 
 use super::text::{Target, format_targets, reserve_command_text};
@@ -121,10 +123,12 @@ fn convert_to_text(s: &mut Session) -> Result<Value> {
 
 /// A list paragraph's tab stops with its Tab Position as a left stop, when composition adds that
 /// stop for the label only: the typed-in label's tab then still reaches it. The IDML export
-/// writes Tab Position as the same stop.
+/// writes Tab Position as the same stop. A stop at the Tab Position or just before it (closer
+/// than [`SAME_TAB_POSITION`], where the list would merge them) is the one composition uses, so
+/// it stays and nothing is added.
 fn list_tab_stops(d: &Document, p: &designcraft_doc::ParaFormat) -> Option<Vec<TabStop>> {
     let (pp, _) = d.styles.resolve_para(p);
-    let t = pp.list_tab.filter(|t| t.is_finite() && *t >= 0.0 && !pp.tabs.iter().any(|s| (s.position - t).abs() < 1e-6))?;
+    let t = pp.list_tab.filter(|t| t.is_finite() && *t >= 0.0 && !pp.tabs.iter().any(|s| s.position <= *t && *t - s.position < SAME_TAB_POSITION))?;
     let mut tabs = pp.tabs;
     tabs.push(TabStop { position: t, align: TabAlign::Left, leader: String::new(), align_on: String::new() });
     Some(TabStop::sanitized_list(tabs))
@@ -345,6 +349,21 @@ mod tests {
             assert_eq!(st.char_format_of(at).over.change, Some(designcraft_doc::ChangeMark::Inserted), "label at {at}");
         }
         assert_eq!(st.char_format_of(3).over.change, None);
+    }
+
+    /// A stop just before the Tab Position is the one composition uses: conversion keeps it rather
+    /// than replacing it with a left stop at the Tab Position.
+    #[test]
+    fn convert_to_text_keeps_a_stop_just_before_the_tab_position() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let sid = list_story(&mut s, "Item", json!({"listType": "bullets", "listTab": 50.0}));
+        s.execute("type.tabs.add", &json!({"position": 49.995, "align": "right"})).unwrap();
+        select(&mut s, sid, 0, 0);
+        convert(&mut s);
+        let tabs = story(&s, sid).paras[0].para.tabs.clone().unwrap_or_default();
+        assert_eq!(tabs.len(), 1, "{tabs:?}");
+        assert_eq!((tabs[0].position, tabs[0].align), (49.995, designcraft_doc::TabAlign::Right), "{tabs:?}");
     }
 
     /// The label's and the text's x from the column's left: a Tab Position keeps placing the text
